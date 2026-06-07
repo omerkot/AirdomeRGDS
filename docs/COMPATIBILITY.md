@@ -1,0 +1,43 @@
+# Compatibility Notes
+
+## Target Firmware
+
+AirdomeRGDS targets the Anbernic RG DS official Linux firmware. It does not target Android.
+
+The tested firmware exposes two SDL video displays at 640x480 and uses Wayland:
+
+```text
+XDG_RUNTIME_DIR=/var/run
+WAYLAND_DISPLAY=wayland-0
+SDL_VIDEODRIVER=wayland
+```
+
+## Display Handling
+
+The game opens one fullscreen SDL window per display. If the firmware reports an LCD swap through:
+
+```text
+/sys/class/anbernic_misc/lcdswap
+```
+
+the launcher sets:
+
+```text
+SDL2_SWAP_LCD=1
+```
+
+## Touch Handling
+
+Only the lower touchscreen is known to report touch events on tested firmware. Upper-screen touch has not been observed through SDL.
+
+The lower touchscreen is mapped into the lower HUD coordinate system.
+
+## Audio
+
+Audio uses SDL's callback API and generated embedded PCM samples. The falling bomb tone uses the original discrete note ladder rather than interpolated pitch steps, because interpolated timer changes sounded crackly on device.
+
+## Quit
+
+On the tested RG DS Linux firmware, START+R button quits the game. The `R` button is the lower-left device button.
+
+START+SELECT is not documented as an RG DS quit combo because it did not exit the game on the tested device.

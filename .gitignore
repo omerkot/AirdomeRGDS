@@ -1,0 +1,7 @@
+.deps/
+build/
+dist/
+*.dSYM/
+.DS_Store
+**/.DS_Store
+log.txt
