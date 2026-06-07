@@ -21,6 +21,7 @@ The upper digitizer has not been exposed by the tested Linux firmware. Lower-scr
 - B: hyperspace
 - X or Y: toggle auto-fire
 - L/R: decrease/increase speed mode
+- SELECT: cycle speed mode upward
 - START: pause, or restart after game over
 - START+R button: quit on RG DS firmware. The `R` button is the lower-left device button.
 - Lower touchscreen: lower-screen HUD controls
@@ -91,6 +92,7 @@ For asset provenance and IP guidance, see [docs/ASSET_PROVENANCE.md](docs/ASSET_
 - `src/` contains the SDL2 native port and generated headers.
 - `assets/rgds/` contains RG DS-ready 640x480 raw ARGB assets.
 - `ports/AirdomeRGDS.sh` is the launcher script copied to `/mnt/mmc/Ports`.
+- `ports/rgds_volume_helper.py` handles volume buttons while the game is running on stock RG DS Linux.
 - `dist/`, `build/`, and `.deps/` are local outputs and are ignored.
 
 ## Legal And IP Notice

@@ -72,9 +72,10 @@ package-rgds: rgds check-rgds-assets
 	mkdir -p dist/rgds/AirdomeRGDS
 	cp ports/AirdomeRGDS.sh dist/rgds/AirdomeRGDS.sh
 	cp $(BUILD_DIR)/$(TARGET)-rgds-aarch64 dist/rgds/AirdomeRGDS/$(TARGET)
+	cp ports/rgds_volume_helper.py dist/rgds/AirdomeRGDS/rgds_volume_helper.py
 	cp -R assets dist/rgds/AirdomeRGDS/assets
 	find dist/rgds -name .DS_Store -delete
-	chmod +x dist/rgds/AirdomeRGDS.sh dist/rgds/AirdomeRGDS/$(TARGET)
+	chmod +x dist/rgds/AirdomeRGDS.sh dist/rgds/AirdomeRGDS/$(TARGET) dist/rgds/AirdomeRGDS/rgds_volume_helper.py
 	cd dist && COPYFILE_DISABLE=1 tar -czf airdomergds-rgds-aarch64.tar.gz rgds
 
 upload-rgds: package-rgds

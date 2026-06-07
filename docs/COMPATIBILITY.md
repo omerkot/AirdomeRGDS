@@ -32,9 +32,17 @@ Only the lower touchscreen is known to report touch events on tested firmware. U
 
 The lower touchscreen is mapped into the lower HUD coordinate system.
 
+## Input Handling
+
+The stock RG DS Linux firmware exposes the game controls through SDL and Linux input devices. To avoid conflicts with PortMaster controller overrides, AirdomeRGDS does not rely on inherited `SDL_GAMECONTROLLERCONFIG` values from the launcher.
+
+On the tested device, the game reads RG DS buttons directly from `/dev/input/event4` and `/dev/input/event5`, and reads analog stick movement from `/dev/input/js0`. SDL controller input is still initialized for display/audio integration and as a fallback path, but direct device input is preferred when available.
+
 ## Audio
 
 Audio uses SDL's callback API and generated embedded PCM samples. The falling bomb tone uses the original discrete note ladder rather than interpolated pitch steps, because interpolated timer changes sounded crackly on device.
+
+The packaged launcher starts `rgds_volume_helper.py`, which watches the RG DS volume key events and adjusts the stock firmware ALSA mixer while the game is running.
 
 ## Quit
 

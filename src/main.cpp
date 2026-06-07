@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 using u8 = uint8_t;
 using u16 = uint16_t;
@@ -99,14 +102,21 @@ static bool nativeDualDisplay = false;
 static u16 nativeHeld = 0;
 static u16 nativeButtonHeld = 0;
 static u16 nativeAxisHeld = 0;
+static u16 nativeJsAxisHeld = 0;
 static u16 nativeHatHeld = 0;
 static u16 nativeTouchHeld = 0;
+static u16 nativeEvdevHeld = 0;
 static u16 nativePressed = 0;
 static u16 nativePrevHeld = 0;
 static bool nativeTouchPending = false;
 static int nativeTouchX = 0;
 static int nativeTouchY = 0;
 static bool nativeQuitCombo = false;
+static int nativeEvdevFds[2] = { -1, -1 };
+static bool nativeEvdevReady = false;
+static int nativeJsFd = -1;
+static int nativeJsAxisX = 0;
+static int nativeJsAxisY = 0;
 static SDL_AudioDeviceID nativeAudioDevice = 0;
 static int nativeAudioRate = 48000;
 static Uint32 nativeLastAudioAttempt = 0;
@@ -282,8 +292,147 @@ static void nativeSetButtonHeld(u16 key, bool down) {
     nativeSetMaskKey(nativeButtonHeld, key, down);
 }
 
+static void nativeSetEvdevHeld(u16 key, bool down) {
+    nativeSetMaskKey(nativeEvdevHeld, key, down);
+}
+
 static void nativeSetTouchHeld(bool down) {
     nativeTouchHeld = down ? KEY_TOUCH : 0;
+}
+
+struct NativeEvdevEvent {
+    long tvSec;
+    long tvUsec;
+    uint16_t type;
+    uint16_t code;
+    int32_t value;
+};
+
+struct NativeJsEvent {
+    uint32_t time;
+    int16_t value;
+    uint8_t type;
+    uint8_t number;
+};
+
+static void nativeInitEvdev() {
+    const char *paths[] = { "/dev/input/event4", "/dev/input/event5" };
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+        int fd = open(paths[i], O_RDONLY | O_NONBLOCK);
+        if (fd >= 0) {
+            nativeEvdevFds[i] = fd;
+            nativeEvdevReady = true;
+            printf("evdev: opened %s\n", paths[i]);
+        }
+    }
+}
+
+static void nativeInitJoystick() {
+    nativeJsFd = open("/dev/input/js0", O_RDONLY | O_NONBLOCK);
+    if (nativeJsFd >= 0) printf("joystick: opened /dev/input/js0\n");
+}
+
+static void nativeShutdownEvdev() {
+    for (size_t i = 0; i < sizeof(nativeEvdevFds) / sizeof(nativeEvdevFds[0]); ++i) {
+        if (nativeEvdevFds[i] >= 0) {
+            close(nativeEvdevFds[i]);
+            nativeEvdevFds[i] = -1;
+        }
+    }
+    nativeEvdevReady = false;
+    nativeEvdevHeld = 0;
+}
+
+static void nativeShutdownJoystick() {
+    if (nativeJsFd >= 0) {
+        close(nativeJsFd);
+        nativeJsFd = -1;
+    }
+    nativeJsAxisHeld = 0;
+    nativeJsAxisX = 0;
+    nativeJsAxisY = 0;
+}
+
+static void nativeApplyEvdevKey(uint16_t code, bool down) {
+    switch (code) {
+        case 103: nativeSetEvdevHeld(KEY_UP, down); break;
+        case 105: nativeSetEvdevHeld(KEY_LEFT, down); break;
+        case 106: nativeSetEvdevHeld(KEY_RIGHT, down); break;
+        case 108: nativeSetEvdevHeld(KEY_DOWN, down); break;
+
+        case 304: nativeSetEvdevHeld(KEY_A, down); break;
+        case 305: nativeSetEvdevHeld(KEY_B, down); break;
+        case 306: nativeSetEvdevHeld(KEY_Y, down); break;
+        case 307: nativeSetEvdevHeld(KEY_X, down); break;
+        case 308: nativeSetEvdevHeld(KEY_L, down); break;
+        case 309: nativeSetEvdevHeld(KEY_R, down); break;
+
+        case 310: nativeSetEvdevHeld(KEY_R, down); break;
+        case 311: nativeSetEvdevHeld(KEY_START, down); break;
+        case 312: nativeSetEvdevHeld(KEY_SELECT, down); break;
+
+        case 314: nativeSetEvdevHeld(KEY_SELECT, down); break;
+        case 315: nativeSetEvdevHeld(KEY_START, down); break;
+        case 316: nativeSetEvdevHeld(KEY_R, down); break;
+        case 354: nativeSetEvdevHeld(KEY_R, down); break;
+        default: break;
+    }
+}
+
+static void nativeUpdateJoystickAxisHeld() {
+    nativeJsAxisHeld = 0;
+    if (nativeJsAxisX < -NATIVE_ANALOG_DEADZONE) nativeJsAxisHeld |= KEY_LEFT;
+    if (nativeJsAxisX > NATIVE_ANALOG_DEADZONE) nativeJsAxisHeld |= KEY_RIGHT;
+    if (nativeJsAxisY < -NATIVE_ANALOG_DEADZONE) nativeJsAxisHeld |= KEY_UP;
+    if (nativeJsAxisY > NATIVE_ANALOG_DEADZONE) nativeJsAxisHeld |= KEY_DOWN;
+}
+
+static void nativePollJoystick() {
+    if (nativeJsFd < 0) return;
+    NativeJsEvent events[16];
+    for (;;) {
+        ssize_t got = read(nativeJsFd, events, sizeof(events));
+        if (got < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            close(nativeJsFd);
+            nativeJsFd = -1;
+            nativeJsAxisHeld = 0;
+            break;
+        }
+        if (got == 0) break;
+        int count = (int)(got / (ssize_t)sizeof(NativeJsEvent));
+        for (int ev = 0; ev < count; ++ev) {
+            uint8_t type = events[ev].type & 0x7f;
+            if (type != 0x02) continue;
+            if (events[ev].number == 0) nativeJsAxisX = events[ev].value;
+            else if (events[ev].number == 1) nativeJsAxisY = events[ev].value;
+        }
+        nativeUpdateJoystickAxisHeld();
+    }
+}
+
+static void nativePollEvdev() {
+    NativeEvdevEvent events[16];
+    for (size_t i = 0; i < sizeof(nativeEvdevFds) / sizeof(nativeEvdevFds[0]); ++i) {
+        int fd = nativeEvdevFds[i];
+        if (fd < 0) continue;
+        for (;;) {
+            ssize_t got = read(fd, events, sizeof(events));
+            if (got < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                close(fd);
+                nativeEvdevFds[i] = -1;
+                break;
+            }
+            if (got == 0) break;
+            int count = (int)(got / (ssize_t)sizeof(NativeEvdevEvent));
+            for (int ev = 0; ev < count; ++ev) {
+                if (events[ev].type != 1) continue;
+                if (events[ev].value == 0) nativeApplyEvdevKey(events[ev].code, false);
+                else if (events[ev].value == 1 || events[ev].value == 2) nativeApplyEvdevKey(events[ev].code, true);
+            }
+        }
+    }
 }
 
 static int nativeClamp16(int v) {
@@ -532,6 +681,9 @@ static void nativeRecordTouch(float fx, float fy) {
 }
 
 static void nativePollEvents() {
+    nativePollEvdev();
+    nativePollJoystick();
+
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         switch (ev.type) {
@@ -562,6 +714,7 @@ static void nativePollEvents() {
             }
             case SDL_CONTROLLERBUTTONDOWN:
             case SDL_CONTROLLERBUTTONUP: {
+                if (nativeEvdevReady) break;
                 bool down = ev.type == SDL_CONTROLLERBUTTONDOWN;
                 switch ((SDL_GameControllerButton)ev.cbutton.button) {
                     case SDL_CONTROLLER_BUTTON_DPAD_LEFT: nativeSetButtonHeld(KEY_LEFT, down); break;
@@ -577,6 +730,24 @@ static void nativePollEvents() {
                     case SDL_CONTROLLER_BUTTON_BACK: nativeSetButtonHeld(KEY_SELECT, down); break;
                     case SDL_CONTROLLER_BUTTON_START: nativeSetButtonHeld(KEY_START, down); break;
                     case SDL_CONTROLLER_BUTTON_GUIDE: if (down && (nativeHeld & KEY_START)) nativeQuitCombo = true; break;
+                    default: break;
+                }
+                break;
+            }
+            case SDL_JOYBUTTONDOWN:
+            case SDL_JOYBUTTONUP: {
+                if (nativeEvdevReady) break;
+                bool down = ev.type == SDL_JOYBUTTONDOWN;
+                switch (ev.jbutton.button) {
+                    case 0: nativeSetButtonHeld(KEY_A, down); break;
+                    case 1: nativeSetButtonHeld(KEY_B, down); break;
+                    case 2: nativeSetButtonHeld(KEY_Y, down); break;
+                    case 3: nativeSetButtonHeld(KEY_X, down); break;
+                    case 4: nativeSetButtonHeld(KEY_L, down); break;
+                    case 5: nativeSetButtonHeld(KEY_R, down); break;
+                    case 6: nativeSetButtonHeld(KEY_R, down); break;
+                    case 7: nativeSetButtonHeld(KEY_START, down); break;
+                    case 8: nativeSetButtonHeld(KEY_SELECT, down); break;
                     default: break;
                 }
                 break;
@@ -630,7 +801,7 @@ static void nativePollEvents() {
         if (ly > NATIVE_ANALOG_DEADZONE) nativeAxisHeld |= KEY_DOWN;
     }
 
-    nativeHeld = nativeButtonHeld | nativeAxisHeld | nativeHatHeld | nativeTouchHeld;
+    nativeHeld = nativeButtonHeld | nativeAxisHeld | nativeJsAxisHeld | nativeHatHeld | nativeTouchHeld | nativeEvdevHeld;
     if ((nativeHeld & KEY_START) && (nativeHeld & KEY_SELECT)) nativeQuitCombo = true;
     if (nativeQuitCombo) nativeRunning = false;
     nativePressed = nativeHeld & (u16)~nativePrevHeld;
@@ -1845,8 +2016,8 @@ static void updatePlayerMovement() {
 // Change Easy/Normal/Hard mode and rescale active timers so switching modes
 // does not create weird cooldown jumps.
 static void setGameSpeedStep(int newStep) {
-    if (newStep < 0) newStep = 0;
-    if (newStep >= GAME_SPEED_STEP_COUNT) newStep = GAME_SPEED_STEP_COUNT - 1;
+    while (newStep < 0) newStep += GAME_SPEED_STEP_COUNT;
+    newStep %= GAME_SPEED_STEP_COUNT;
     if (newStep == gameSpeedStep) return;
 
     int oldSpeed = gameSpeedPercent();
@@ -2371,7 +2542,7 @@ static void handleInput() {
     if (autoToggleHeld && !lastAutoToggleHeld) autoFire = !autoFire;
     lastAutoToggleHeld = autoToggleHeld;
     if (down & KEY_L) setGameSpeedStep(gameSpeedStep - 1);
-    if (down & KEY_R) setGameSpeedStep(gameSpeedStep + 1);
+    if (down & (KEY_R | KEY_SELECT)) setGameSpeedStep(gameSpeedStep + 1);
     if (down & KEY_B) hyperspace();
     if (down & KEY_A) fireBullet();
 }
@@ -2395,6 +2566,8 @@ int main(int argc, char **argv) {
     }
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "best");
     nativeInitAudio();
+    nativeInitEvdev();
+    nativeInitJoystick();
 
     int displays = SDL_GetNumVideoDisplays();
     printf("SDL displays: %d\n", displays);
@@ -2448,6 +2621,8 @@ int main(int argc, char **argv) {
     }
 
     if (nativeController) SDL_GameControllerClose(nativeController);
+    nativeShutdownJoystick();
+    nativeShutdownEvdev();
     nativeShutdownAudio();
     nativeDestroyPanel(nativeBottom);
     nativeDestroyPanel(nativeTop);

@@ -44,6 +44,7 @@ The resulting layout on the device should be:
 ```text
 /mnt/mmc/Ports/AirdomeRGDS.sh
 /mnt/mmc/Ports/AirdomeRGDS/airdomergds
+/mnt/mmc/Ports/AirdomeRGDS/rgds_volume_helper.py
 /mnt/mmc/Ports/AirdomeRGDS/assets/rgds/*.argb
 ```
 
@@ -68,6 +69,8 @@ SDL_VIDEODRIVER=wayland
 
 It also respects the firmware `lcdswap` setting by setting `SDL2_SWAP_LCD=1` when needed.
 
+The launcher intentionally clears inherited SDL controller mapping variables before starting the game. AirdomeRGDS reads the RG DS game buttons directly from the stock Linux input devices and reads the analog stick from `/dev/input/js0`, which keeps the controls independent of PortMaster controller overrides. The bundled `rgds_volume_helper.py` watches the RG DS volume keys and adjusts the ALSA mixer while the game is active.
+
 You can also build, package, and copy in one step:
 
 ```sh
@@ -81,6 +84,7 @@ make upload-rgds RGDS_HOST=root@<rgds-ip>
 - B: hyperspace
 - X/Y: auto-fire
 - L/R: speed mode
+- SELECT: cycle speed mode upward
 - START: pause or restart after game over
 - START+R button: quit. The `R` button is the lower-left device button.
 - Lower touchscreen: HUD controls
@@ -99,5 +103,6 @@ Common checks:
 
 - The files are under `/mnt/mmc/Ports`, not the Android storage area.
 - `AirdomeRGDS.sh` and `airdomergds` are executable.
+- `rgds_volume_helper.py` is present and executable if volume buttons should work in-game.
 - The official Linux firmware has SDL2 available as `libSDL2-2.0.so.0`.
 - The assets exist under `/mnt/mmc/Ports/AirdomeRGDS/assets/rgds/`.
