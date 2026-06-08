@@ -9,7 +9,7 @@ The game runs directly through SDL2 on the RG DS Linux environment, opens both p
 - Target device: Anbernic RG DS official Linux firmware.
 - Display: two SDL/Wayland displays at 640x480 each.
 - Controls: RG DS buttons, d-pad, left stick, and lower touchscreen.
-- Audio: SDL audio with generated/embedded PCM samples.
+- Audio: SDL audio with generated/embedded PCM samples, scaled to the stock RG DS loader volume.
 - Packaging: Port-style folder under `/mnt/mmc/Ports`.
 
 The upper digitizer has not been exposed by the tested Linux firmware. Lower-screen touch works and is used for HUD controls.
@@ -24,6 +24,7 @@ The upper digitizer has not been exposed by the tested Linux firmware. Lower-scr
 - SELECT: cycle speed mode upward
 - START: pause, or restart after game over
 - START+R button: quit on RG DS firmware. The `R` button is the lower-left device button.
+- Volume buttons: follow the stock RG DS loader volume level.
 - Lower touchscreen: lower-screen HUD controls
 
 Any button or lower-screen touch starts from the title screen. A title-screen touch is consumed only as a start action, so it will not also change difficulty after gameplay begins.
@@ -92,7 +93,7 @@ For asset provenance and IP guidance, see [docs/ASSET_PROVENANCE.md](docs/ASSET_
 - `src/` contains the SDL2 native port and generated headers.
 - `assets/rgds/` contains RG DS-ready 640x480 raw ARGB assets.
 - `ports/AirdomeRGDS.sh` is the launcher script copied to `/mnt/mmc/Ports`.
-- `ports/rgds_volume_helper.py` handles volume buttons while the game is running on stock RG DS Linux.
+- `ports/rgds_volume_helper.py` keeps volume buttons synchronized with the stock RG DS loader volume while the game is running.
 - `dist/`, `build/`, and `.deps/` are local outputs and are ignored.
 
 ## Legal And IP Notice

@@ -42,7 +42,15 @@ On the tested device, the game reads RG DS buttons directly from `/dev/input/eve
 
 Audio uses SDL's callback API and generated embedded PCM samples. The falling bomb tone uses the original discrete note ladder rather than interpolated pitch steps, because interpolated timer changes sounded crackly on device.
 
-The packaged launcher starts `rgds_volume_helper.py`, which watches the RG DS volume key events and adjusts the stock firmware ALSA mixer while the game is running.
+On the tested firmware, the loader exposes its logical volume level at:
+
+```text
+/sys/class/anbernic_misc/openbor_volume
+```
+
+AirdomeRGDS scales its mixed SDL audio to that loader volume level at startup and while running. The packaged launcher starts `rgds_volume_helper.py`, which watches the RG DS volume key events and updates the same loader volume value.
+
+The in-game gain curve is tuned for finer low-volume control: loader levels 0-4 map to 0%, 2.5%, 5%, 7.5%, and 10% gain, then levels 5-10 rise linearly to 100%.
 
 ## Quit
 

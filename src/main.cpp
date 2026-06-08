@@ -117,6 +117,9 @@ static bool nativeEvdevReady = false;
 static int nativeJsFd = -1;
 static int nativeJsAxisX = 0;
 static int nativeJsAxisY = 0;
+static int nativeVolumeGainQ15 = 32768;
+static int nativeLastVolumeLevel = -1;
+static Uint32 nativeLastVolumePoll = 0;
 static SDL_AudioDeviceID nativeAudioDevice = 0;
 static int nativeAudioRate = 48000;
 static Uint32 nativeLastAudioAttempt = 0;
@@ -315,6 +318,37 @@ struct NativeJsEvent {
     uint8_t number;
 };
 
+static int nativeReadIntFile(const char *path, int fallback) {
+    char buf[32];
+    int fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) return fallback;
+    ssize_t got = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (got <= 0) return fallback;
+    buf[got] = '\0';
+    return atoi(buf);
+}
+
+static void nativePollVolume(bool force = false) {
+    Uint32 now = SDL_GetTicks();
+    if (!force && now - nativeLastVolumePoll < 100) return;
+    nativeLastVolumePoll = now;
+
+    static const int volumeCurveQ15[] = {
+        0, 819, 1638, 2458, 3277, 8192, 13107, 18022, 22938, 27853, 32768
+    };
+    int level = nativeReadIntFile("/sys/class/anbernic_misc/openbor_volume", 10);
+    if (level < 0) level = 0;
+    if (level >= (int)(sizeof(volumeCurveQ15) / sizeof(volumeCurveQ15[0]))) {
+        level = (int)(sizeof(volumeCurveQ15) / sizeof(volumeCurveQ15[0])) - 1;
+    }
+    nativeVolumeGainQ15 = volumeCurveQ15[level];
+    if (level != nativeLastVolumeLevel) {
+        nativeLastVolumeLevel = level;
+        printf("volume: loader level %d, gain %.0f%%\n", level, nativeVolumeGainQ15 * 100.0 / 32768.0);
+    }
+}
+
 static void nativeInitEvdev() {
     const char *paths[] = { "/dev/input/event4", "/dev/input/event5" };
     for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
@@ -500,6 +534,7 @@ static void nativeAudioCallback(void *, Uint8 *stream, int len) {
         mixed += nativeVoiceSample(nativeMissileVoice);
         mixed += nativeVoiceSample(nativeUfoDroneVoice);
         mixed += nativeVoiceSample(nativeUfoShotVoice);
+        mixed = (int)(((int64_t)mixed * nativeVolumeGainQ15) / 32768);
         mixed = nativeClamp16(mixed);
         out[i * 2] = (s16)mixed;
         out[i * 2 + 1] = (s16)mixed;
@@ -683,6 +718,7 @@ static void nativeRecordTouch(float fx, float fy) {
 static void nativePollEvents() {
     nativePollEvdev();
     nativePollJoystick();
+    nativePollVolume();
 
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
@@ -2565,6 +2601,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "best");
+    nativePollVolume(true);
     nativeInitAudio();
     nativeInitEvdev();
     nativeInitJoystick();
