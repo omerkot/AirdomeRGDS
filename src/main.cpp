@@ -140,12 +140,26 @@ static const int NATIVE_MAX_VOICES = 12;
 static const int NATIVE_DS_SOUND_RATE = 32768;
 static const int NATIVE_WAV_SOUND_RATE = 11025;
 static NativeVoice nativeVoices[NATIVE_MAX_VOICES];
-static NativeVoice nativeBombVoice;
+
+// Every falling bomb gets its own continuous tone voice so simultaneous bombs
+// are all audible, matching the original game's mixer.
+static const int NATIVE_MAX_BOMB_TONES = 8;
+struct NativeBombTone {
+    NativeVoice voice;
+    int id = 0;
+    u16 timer = 0;
+};
+static NativeBombTone nativeBombTones[NATIVE_MAX_BOMB_TONES];
+
+struct NativeBombToneRequest {
+    int id;
+    u16 timer;
+    u8 volume;
+};
+
 static NativeVoice nativeMissileVoice;
 static NativeVoice nativeUfoDroneVoice;
 static NativeVoice nativeUfoShotVoice;
-static u16 nativeLastBombTimer = 0;
-static u16 nativeLastBombVolume = 0;
 static u8 nativeMissileNoteWait = 0;
 static u8 nativeMissileNoteFrames = 0;
 static u16 nativeLastUfoShotSeq = 0;
@@ -530,7 +544,9 @@ static void nativeAudioCallback(void *, Uint8 *stream, int len) {
         for (int v = 0; v < NATIVE_MAX_VOICES; ++v) {
             mixed += nativeVoiceSample(nativeVoices[v]);
         }
-        mixed += nativeVoiceSample(nativeBombVoice);
+        for (int v = 0; v < NATIVE_MAX_BOMB_TONES; ++v) {
+            mixed += nativeVoiceSample(nativeBombTones[v].voice);
+        }
         mixed += nativeVoiceSample(nativeMissileVoice);
         mixed += nativeVoiceSample(nativeUfoDroneVoice);
         mixed += nativeVoiceSample(nativeUfoShotVoice);
@@ -613,14 +629,47 @@ static void nativeStopVoice(NativeVoice &voice) {
     voice.framesLeft = 0;
 }
 
-static void nativeUpdateContinuousAudio(u16 bombTimer, u16 bombVolume, bool missileActive, bool ufoActive, u16 ufoShotSeq) {
+static void nativeUpdateContinuousAudio(const NativeBombToneRequest *bombs, int bombCount, bool missileActive, bool ufoActive, u16 ufoShotSeq) {
     if (!nativeAudioDevice) return;
     SDL_LockAudioDevice(nativeAudioDevice);
 
+    // Release voices whose bomb is gone, then start or retune one voice per
+    // requested bomb. Nothing is suppressed; all tones mix together.
+    for (int i = 0; i < NATIVE_MAX_BOMB_TONES; ++i) {
+        NativeBombTone &tone = nativeBombTones[i];
+        if (tone.id == 0) continue;
+        bool present = false;
+        for (int b = 0; b < bombCount; ++b) {
+            if (bombs[b].id == tone.id) { present = true; break; }
+        }
+        if (!present) {
+            nativeStopVoice(tone.voice);
+            tone.id = 0;
+            tone.timer = 0;
+        }
+    }
+    for (int b = 0; b < bombCount; ++b) {
+        int slot = -1;
+        for (int i = 0; i < NATIVE_MAX_BOMB_TONES; ++i) {
+            if (nativeBombTones[i].id == bombs[b].id) { slot = i; break; }
+        }
+        if (slot < 0) {
+            for (int i = 0; i < NATIVE_MAX_BOMB_TONES; ++i) {
+                if (nativeBombTones[i].id == 0) { slot = i; break; }
+            }
+        }
+        if (slot < 0) continue;
+        NativeBombTone &tone = nativeBombTones[slot];
+        if (tone.id != bombs[b].id || tone.timer != bombs[b].timer) {
+            nativeStartVoice(tone.voice, native_audio_bomb_tone_sample, native_audio_bomb_tone_sample_count, nativeSampleRateFromDsTimer(bombs[b].timer), bombs[b].volume > 127 ? 127 : bombs[b].volume, true, -1);
+            tone.id = bombs[b].id;
+            tone.timer = bombs[b].timer;
+        }
+    }
+
+    // Missile warning beep runs alongside the bomb tones instead of replacing
+    // them.
     if (missileActive) {
-        if (nativeLastBombTimer != 0 || nativeLastBombVolume != 0) nativeStopVoice(nativeBombVoice);
-        nativeLastBombTimer = 0;
-        nativeLastBombVolume = 0;
         if (nativeMissileNoteWait == 0) {
             nativeStartVoice(nativeMissileVoice, native_audio_missile_note_sample, native_audio_missile_note_sample_count, nativeSampleRateFromDsTimer(65369), 44, true, nativeAudioRate / 2);
             nativeMissileNoteFrames = 30;
@@ -633,15 +682,6 @@ static void nativeUpdateContinuousAudio(u16 bombTimer, u16 bombVolume, bool miss
         nativeMissileNoteWait = 0;
         nativeMissileNoteFrames = 0;
         nativeStopVoice(nativeMissileVoice);
-        if (bombTimer == 0 || bombVolume == 0) {
-            if (nativeLastBombTimer != 0 || nativeLastBombVolume != 0) nativeStopVoice(nativeBombVoice);
-            nativeLastBombTimer = 0;
-            nativeLastBombVolume = 0;
-        } else if (bombTimer != nativeLastBombTimer || bombVolume != nativeLastBombVolume) {
-            nativeStartVoice(nativeBombVoice, native_audio_bomb_tone_sample, native_audio_bomb_tone_sample_count, nativeSampleRateFromDsTimer(bombTimer), bombVolume > 127 ? 127 : (u8)bombVolume, true, -1);
-            nativeLastBombTimer = bombTimer;
-            nativeLastBombVolume = bombVolume;
-        }
     }
 
     if (ufoActive) {
@@ -989,14 +1029,16 @@ static u16 backSub[SCREEN_W * SCREEN_H];
 static u16 nativeMainBackdropCompare[SCREEN_W * SCREEN_H];
 static const u16 *nativeTopTransparentBase = nullptr;
 static const u16 *nativeBottomTransparentBase = nullptr;
-static u16 *objectDrawTarget = backMain;
+
+// Active native-resolution detail buffer. Set to the gameplay (top) layer for
+// objects/cannon, or the HUD (bottom) layer for the score readouts.
+static u32 *detailTarget = nullptr;
 
 static Object objects[MAX_OBJECTS];
 static Bullet bullets[MAX_BULLETS];
 static Particle particles[MAX_PARTICLES];
 static Star stars[58];
 static int drawAlpha = 255;
-static u16 objectSpriteScratch[SCREEN_W * SCREEN_H];
 
 // Core run state. Timers are counted in gameplay update ticks, then converted
 // with timerByGameSpeed() when the selected speed mode changes duration.
@@ -1033,7 +1075,6 @@ static int lastLevelForUfoTimer = 1;
 static u32 rngState = 0x7A5EED5Du;
 
 static bool objectTouchesPlayer(const Object &o);
-static bool objectHasSmoothDraw(const Object &o);
 
 // Reset all real-time pacing diagnostics and accumulator state. This is called
 // when a run starts so stale title-screen time does not create a burst of ticks.
@@ -1075,47 +1116,35 @@ static void playIntercept() { sendArm7SoundCommand(7); }
 // drives its drone/shot sounds.
 static void publishBombDropSound() {
     if (startScreen || paused || gameOver || deathTimer > 0) {
-        nativeUpdateContinuousAudio(0, 0, false, false, ufoShotSequence);
+        nativeUpdateContinuousAudio(nullptr, 0, false, false, ufoShotSequence);
         return;
     }
 
-    Object *trackedBomb = 0;
-    Object *trackedMissile = 0;
+    NativeBombToneRequest bombs[NATIVE_MAX_BOMB_TONES];
+    int bombCount = 0;
     bool hasUfo = false;
-    int bestOrder = 0x7FFFFFFF;
-    int bestMissileOrder = 0x7FFFFFFF;
+    bool missileActive = false;
     for (int i = 0; i < MAX_OBJECTS; i++) {
         Object &o = objects[i];
         if (!o.active) continue;
         if (o.type == OBJ_UFO) hasUfo = true;
-        if (o.type == OBJ_MISSILE && o.soundOrder > 0 && o.soundOrder < bestMissileOrder) {
-            trackedMissile = &o;
-            bestMissileOrder = o.soundOrder;
-        }
+        if (o.type == OBJ_MISSILE && o.soundOrder > 0) missileActive = true;
         if (o.type != OBJ_SPINNER_BIG && o.type != OBJ_SPINNER_SMALL) continue;
-        if (o.soundOrder > 0 && o.soundOrder < bestOrder) {
-            trackedBomb = &o;
-            bestOrder = o.soundOrder;
-        }
+        if (o.soundOrder <= 0 || bombCount >= NATIVE_MAX_BOMB_TONES) continue;
+
+        int total = o.soundTotalUpdates;
+        if (total < BOMB_NOTE_STEPS) total = BOMB_NOTE_STEPS;
+        int step = (o.soundAge * (BOMB_NOTE_STEPS - 1)) / total;
+        if (step < 0) step = 0;
+        if (step >= BOMB_NOTE_STEPS) step = BOMB_NOTE_STEPS - 1;
+
+        bombs[bombCount].id = o.soundOrder;
+        bombs[bombCount].timer = BOMB_NOTE_TIMERS[step];
+        bombs[bombCount].volume = 32;
+        bombCount++;
     }
 
-    if (trackedMissile) {
-        nativeUpdateContinuousAudio(0, 0, true, hasUfo, ufoShotSequence);
-        return;
-    }
-
-    if (!trackedBomb) {
-        nativeUpdateContinuousAudio(0, 0, false, hasUfo, ufoShotSequence);
-        return;
-    }
-
-    int total = trackedBomb->soundTotalUpdates;
-    if (total < BOMB_NOTE_STEPS) total = BOMB_NOTE_STEPS;
-    int step = (trackedBomb->soundAge * (BOMB_NOTE_STEPS - 1)) / total;
-    if (step < 0) step = 0;
-    if (step >= BOMB_NOTE_STEPS) step = BOMB_NOTE_STEPS - 1;
-
-    nativeUpdateContinuousAudio(BOMB_NOTE_TIMERS[step], 32, false, hasUfo, ufoShotSequence);
+    nativeUpdateContinuousAudio(bombs, bombCount, missileActive, hasUfo, ufoShotSequence);
 }
 
 
@@ -1171,10 +1200,6 @@ static int randomInt(int maxValue) {
 }
 
 static int absInt(int v) { return v < 0 ? -v : v; }
-
-static int floorDivInt(int n, int d) {
-    return n >= 0 ? n / d : -((-n + d - 1) / d);
-}
 
 // Translate score to the visible game level. Level controls background,
 // difficulty scaling, score multiplier, and some enemy availability.
@@ -1322,30 +1347,6 @@ static void drawLine(u16 *fb, int x0, int y0, int x1, int y1, u16 color) {
     }
 }
 
-// Filled triangle used by the rocky asteroid facets and several simple ship
-// shapes. Coordinates are clipped indirectly by fillRect/putPixel.
-static void fillTriangle(u16 *fb, int x0, int y0, int x1, int y1, int x2, int y2, u16 color) {
-    if (y0 > y1) { int tx = x0; x0 = x1; x1 = tx; int ty = y0; y0 = y1; y1 = ty; }
-    if (y1 > y2) { int tx = x1; x1 = x2; x2 = tx; int ty = y1; y1 = y2; y2 = ty; }
-    if (y0 > y1) { int tx = x0; x0 = x1; x1 = tx; int ty = y0; y0 = y1; y1 = ty; }
-
-    int totalHeight = y2 - y0;
-    if (totalHeight == 0) return;
-
-    for (int i = 0; i <= totalHeight; i++) {
-        bool secondHalf = i > y1 - y0 || y1 == y0;
-        int segmentHeight = secondHalf ? y2 - y1 : y1 - y0;
-        if (segmentHeight == 0) continue;
-
-        int ax = x0 + (x2 - x0) * i / totalHeight;
-        int bx = secondHalf
-            ? x1 + (x2 - x1) * (i - (y1 - y0)) / segmentHeight
-            : x0 + (x1 - x0) * i / segmentHeight;
-        if (ax > bx) { int t = ax; ax = bx; bx = t; }
-        fillRect(fb, ax, y0 + i, bx - ax + 1, 1, color);
-    }
-}
-
 // Deterministic per-object jitter. Asteroids use it so their outlines stay
 // stable frame to frame but still look irregular.
 static int pseudoJitter(int seed, int index, int amount) {
@@ -1354,120 +1355,6 @@ static int pseudoJitter(int seed, int index, int amount) {
     v *= 0x7feb352du;
     v ^= v >> 15;
     return (int)(v % (u32)(amount * 2 + 1)) - amount;
-}
-
-static void fillCircle(u16 *fb, int cx, int cy, int r, u16 color) {
-    for (int y = -r; y <= r; y++) {
-        int yy = cy + y;
-        if (yy < 0 || yy >= SCREEN_H) continue;
-        for (int x = -r; x <= r; x++) {
-            if (x * x + y * y <= r * r) putPixel(fb, cx + x, yy, color);
-        }
-    }
-}
-
-static void drawCircleOutline(u16 *fb, int cx, int cy, int r, u16 color) {
-    int x = r;
-    int y = 0;
-    int err = 0;
-    while (x >= y) {
-        putPixel(fb, cx + x, cy + y, color);
-        putPixel(fb, cx + y, cy + x, color);
-        putPixel(fb, cx - y, cy + x, color);
-        putPixel(fb, cx - x, cy + y, color);
-        putPixel(fb, cx - x, cy - y, color);
-        putPixel(fb, cx - y, cy - x, color);
-        putPixel(fb, cx + y, cy - x, color);
-        putPixel(fb, cx + x, cy - y, color);
-        y++;
-        if (err <= 0) err += 2 * y + 1;
-        if (err > 0) { x--; err -= 2 * x + 1; }
-    }
-}
-
-static void drawSoftDot(u16 *fb, int x, int y, u16 core, u16 fringe) {
-    putPixel(fb, x, y, core);
-    putPixel(fb, x - 1, y, fringe);
-    putPixel(fb, x + 1, y, fringe);
-    putPixel(fb, x, y - 1, fringe);
-    putPixel(fb, x, y + 1, fringe);
-}
-
-// Minimal 3x5 bitmap font. It is intentionally primitive and fast, and keeps
-// the project independent from font assets or text engines.
-static void glyphRows(char ch, u8 rows[5]) {
-    for (int i = 0; i < 5; i++) rows[i] = 0;
-    switch (ch) {
-        case '0': rows[0]=7; rows[1]=5; rows[2]=5; rows[3]=5; rows[4]=7; break;
-        case '1': rows[0]=2; rows[1]=6; rows[2]=2; rows[3]=2; rows[4]=7; break;
-        case '2': rows[0]=7; rows[1]=1; rows[2]=7; rows[3]=4; rows[4]=7; break;
-        case '3': rows[0]=7; rows[1]=1; rows[2]=3; rows[3]=1; rows[4]=7; break;
-        case '4': rows[0]=5; rows[1]=5; rows[2]=7; rows[3]=1; rows[4]=1; break;
-        case '5': rows[0]=7; rows[1]=4; rows[2]=7; rows[3]=1; rows[4]=7; break;
-        case '6': rows[0]=7; rows[1]=4; rows[2]=7; rows[3]=5; rows[4]=7; break;
-        case '7': rows[0]=7; rows[1]=1; rows[2]=2; rows[3]=2; rows[4]=2; break;
-        case '8': rows[0]=7; rows[1]=5; rows[2]=7; rows[3]=5; rows[4]=7; break;
-        case '9': rows[0]=7; rows[1]=5; rows[2]=7; rows[3]=1; rows[4]=7; break;
-        case 'A': rows[0]=7; rows[1]=5; rows[2]=7; rows[3]=5; rows[4]=5; break;
-        case 'B': rows[0]=6; rows[1]=5; rows[2]=6; rows[3]=5; rows[4]=6; break;
-        case 'C': rows[0]=7; rows[1]=4; rows[2]=4; rows[3]=4; rows[4]=7; break;
-        case 'D': rows[0]=6; rows[1]=5; rows[2]=5; rows[3]=5; rows[4]=6; break;
-        case 'E': rows[0]=7; rows[1]=4; rows[2]=6; rows[3]=4; rows[4]=7; break;
-        case 'F': rows[0]=7; rows[1]=4; rows[2]=6; rows[3]=4; rows[4]=4; break;
-        case 'G': rows[0]=7; rows[1]=4; rows[2]=5; rows[3]=5; rows[4]=7; break;
-        case 'H': rows[0]=5; rows[1]=5; rows[2]=7; rows[3]=5; rows[4]=5; break;
-        case 'I': rows[0]=7; rows[1]=2; rows[2]=2; rows[3]=2; rows[4]=7; break;
-        case 'K': rows[0]=5; rows[1]=5; rows[2]=6; rows[3]=5; rows[4]=5; break;
-        case 'L': rows[0]=4; rows[1]=4; rows[2]=4; rows[3]=4; rows[4]=7; break;
-        case 'M': rows[0]=5; rows[1]=7; rows[2]=7; rows[3]=5; rows[4]=5; break;
-        case 'N': rows[0]=5; rows[1]=7; rows[2]=7; rows[3]=7; rows[4]=5; break;
-        case 'O': rows[0]=7; rows[1]=5; rows[2]=5; rows[3]=5; rows[4]=7; break;
-        case 'P': rows[0]=7; rows[1]=5; rows[2]=7; rows[3]=4; rows[4]=4; break;
-        case 'R': rows[0]=7; rows[1]=5; rows[2]=6; rows[3]=5; rows[4]=5; break;
-        case 'S': rows[0]=7; rows[1]=4; rows[2]=7; rows[3]=1; rows[4]=7; break;
-        case 'T': rows[0]=7; rows[1]=2; rows[2]=2; rows[3]=2; rows[4]=2; break;
-        case 'U': rows[0]=5; rows[1]=5; rows[2]=5; rows[3]=5; rows[4]=7; break;
-        case 'V': rows[0]=5; rows[1]=5; rows[2]=5; rows[3]=5; rows[4]=2; break;
-        case 'W': rows[0]=5; rows[1]=5; rows[2]=7; rows[3]=7; rows[4]=5; break;
-        case 'X': rows[0]=5; rows[1]=5; rows[2]=2; rows[3]=5; rows[4]=5; break;
-        case 'Y': rows[0]=5; rows[1]=5; rows[2]=2; rows[3]=2; rows[4]=2; break;
-        case '-': rows[2]=7; break;
-        case ':': rows[1]=2; rows[3]=2; break;
-        case '/': rows[0]=1; rows[1]=1; rows[2]=2; rows[3]=4; rows[4]=4; break;
-        default: break;
-    }
-}
-
-static void drawChar(u16 *fb, int x, int y, char ch, u16 color, int scale) {
-    if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
-    u8 rows[5];
-    glyphRows(ch, rows);
-    for (int yy = 0; yy < 5; yy++) {
-        for (int xx = 0; xx < 3; xx++) {
-            if (rows[yy] & (1 << (2 - xx))) {
-                fillRect(fb, x + xx * scale, y + yy * scale, scale, scale, color);
-            }
-        }
-    }
-}
-
-static int textPixelWidth(const char *text, int scale) {
-    int chars = 0;
-    while (text[chars]) chars++;
-    return chars > 0 ? chars * 4 * scale - scale : 0;
-}
-
-static void drawText(u16 *fb, int x, int y, const char *text, u16 color, int scale) {
-    int cursor = x;
-    while (*text) {
-        if (*text != ' ') drawChar(fb, cursor, y, *text, color, scale);
-        cursor += 4 * scale;
-        text++;
-    }
-}
-
-static void drawTextCentered(u16 *fb, int cx, int y, const char *text, u16 color, int scale) {
-    drawText(fb, cx - textPixelWidth(text, scale) / 2, y, text, color, scale);
 }
 
 static void intToText(int value, char *buf, int bufSize) {
@@ -1486,26 +1373,6 @@ static void intToText(int value, char *buf, int bufSize) {
         char t = buf[a]; buf[a] = buf[b]; buf[b] = t;
     }
     buf[idx] = 0;
-}
-
-static void drawTextCenteredInBox(u16 *fb, int left, int right, int y, const char *text, u16 color, int maxScale) {
-    int maxWidth = right - left + 1;
-    int x = left + (maxWidth - textPixelWidth(text, maxScale)) / 2;
-    drawText(fb, x, y, text, color, maxScale);
-}
-
-static void drawIntCentered(u16 *fb, int cx, int y, int value, u16 color, int scale) {
-    char buf[16];
-    intToText(value, buf, sizeof(buf));
-    drawTextCentered(fb, cx, y, buf, color, scale);
-}
-
-// Center an integer inside a fixed panel box. Used for score so 2-digit and
-// 6-digit values share the same visual center.
-static void drawIntCenteredInBox(u16 *fb, int left, int right, int y, int value, u16 color, int maxScale) {
-    char buf[16];
-    intToText(value, buf, sizeof(buf));
-    drawTextCenteredInBox(fb, left, right, y, buf, color, maxScale);
 }
 
 // Add a single particle to the fixed pool. If the pool is full, the effect is
@@ -2152,12 +2019,292 @@ static void drawBackground() {
 }
 
 // Draw a faceted asteroid from deterministic jittered vertices.
-static void drawMeteor(const Object &o) {
-    int x = pixelFromFixed(o.x);
-    int y = pixelFromFixed(o.y);
-    int r = o.radius;
+// ---------------------------------------------------------------------------
+// Native-resolution (640x480) drawing into a detail layer. Objects, the cannon,
+// and HUD readouts render here at full panel resolution instead of being
+// upscaled 2.5x from the 256x192 buffer. detailTarget selects which screen's
+// layer is the destination.
+// ---------------------------------------------------------------------------
+static int detailPixelFromFixedX(int v) {
+    return (int)(((long long)v * RGDS_SCREEN_W / SCREEN_W + ONE / 2) >> FP);
+}
+
+static int detailPixelFromFixedY(int v) {
+    return (int)(((long long)v * RGDS_SCREEN_H / SCREEN_H + ONE / 2) >> FP);
+}
+
+// Uniform sprite scale (both axes are exactly 2.5x on the RG DS panels).
+static int detailScale(int v) {
+    return v * RGDS_SCREEN_H / SCREEN_H;
+}
+
+static void fillRectDetail(int x, int y, int w, int h, u16 color) {
+    if (!detailTarget) return;
+    int x0 = x < 0 ? 0 : x;
+    int y0 = y < 0 ? 0 : y;
+    int x1 = x + w > RGDS_SCREEN_W ? RGDS_SCREEN_W : x + w;
+    int y1 = y + h > RGDS_SCREEN_H ? RGDS_SCREEN_H : y + h;
+    u32 argb = rgb15ToArgb(color);
+    for (int yy = y0; yy < y1; yy++) {
+        u32 *row = detailTarget + yy * RGDS_SCREEN_W;
+        for (int xx = x0; xx < x1; xx++) row[xx] = argb;
+    }
+}
+
+static void putPixelDetail(int x, int y, u16 color) {
+    if (!detailTarget) return;
+    if (x < 0 || x >= RGDS_SCREEN_W || y < 0 || y >= RGDS_SCREEN_H) return;
+    detailTarget[y * RGDS_SCREEN_W + x] = rgb15ToArgb(color);
+}
+
+// One low-res pixel covers 2.5 native pixels, so accents use 2x2 blocks.
+static void putThickPixelDetail(int x, int y, u16 color) {
+    fillRectDetail(x, y, 2, 2, color);
+}
+
+static void drawLineDetailWidth(int x0, int y0, int x1, int y1, u16 color, int width) {
+    int dx = absInt(x1 - x0);
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = -absInt(y1 - y0);
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    while (1) {
+        fillRectDetail(x0, y0, width, width, color);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = err * 2;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+static void drawLineDetail(int x0, int y0, int x1, int y1, u16 color) {
+    drawLineDetailWidth(x0, y0, x1, y1, color, 2);
+}
+
+static void fillTriangleDetail(int x0, int y0, int x1, int y1, int x2, int y2, u16 color) {
+    if (y0 > y1) { int tx = x0; x0 = x1; x1 = tx; int ty = y0; y0 = y1; y1 = ty; }
+    if (y1 > y2) { int tx = x1; x1 = x2; x2 = tx; int ty = y1; y1 = y2; y2 = ty; }
+    if (y0 > y1) { int tx = x0; x0 = x1; x1 = tx; int ty = y0; y0 = y1; y1 = ty; }
+
+    int totalHeight = y2 - y0;
+    if (totalHeight == 0) return;
+
+    for (int i = 0; i <= totalHeight; i++) {
+        bool secondHalf = i > y1 - y0 || y1 == y0;
+        int segmentHeight = secondHalf ? y2 - y1 : y1 - y0;
+        if (segmentHeight == 0) continue;
+
+        int ax = x0 + (x2 - x0) * i / totalHeight;
+        int bx = secondHalf
+            ? x1 + (x2 - x1) * (i - (y1 - y0)) / segmentHeight
+            : x0 + (x1 - x0) * i / segmentHeight;
+        if (ax > bx) { int t = ax; ax = bx; bx = t; }
+        fillRectDetail(ax, y0 + i, bx - ax + 1, 1, color);
+    }
+}
+
+static void fillCircleDetail(int cx, int cy, int r, u16 color) {
+    if (!detailTarget) return;
+    u32 argb = rgb15ToArgb(color);
+    for (int y = -r; y <= r; y++) {
+        int yy = cy + y;
+        if (yy < 0 || yy >= RGDS_SCREEN_H) continue;
+        u32 *row = detailTarget + yy * RGDS_SCREEN_W;
+        for (int x = -r; x <= r; x++) {
+            int xx = cx + x;
+            if (xx < 0 || xx >= RGDS_SCREEN_W) continue;
+            if (x * x + y * y <= r * r) row[xx] = argb;
+        }
+    }
+}
+
+static void drawCircleOutlineDetail(int cx, int cy, int r, u16 color) {
+    int x = r;
+    int y = 0;
+    int err = 0;
+    while (x >= y) {
+        putPixelDetail(cx + x, cy + y, color);
+        putPixelDetail(cx + y, cy + x, color);
+        putPixelDetail(cx - y, cy + x, color);
+        putPixelDetail(cx - x, cy + y, color);
+        putPixelDetail(cx - x, cy - y, color);
+        putPixelDetail(cx - y, cy - x, color);
+        putPixelDetail(cx + y, cy - x, color);
+        putPixelDetail(cx + x, cy - y, color);
+        y++;
+        if (err <= 0) err += 2 * y + 1;
+        if (err > 0) { x--; err -= 2 * x + 1; }
+    }
+}
+
+static void drawSoftDotDetail(int x, int y, u16 core, u16 fringe) {
+    fillCircleDetail(x, y, 3, fringe);
+    fillCircleDetail(x, y, 2, core);
+}
+
+// Larger 5x7 font for the prominent texts: HUD readouts, difficulty, PAUSED,
+// and GAME OVER. Digits plus the letters those strings need are defined.
+static void glyph7Rows(char ch, u8 rows[7]) {
+    static const char chars[] = "0123456789ADEGHLMNOPRSUVY";
+    static const u8 data[][7] = {
+        { 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E }, // 0
+        { 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E }, // 1
+        { 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F }, // 2
+        { 0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E }, // 3
+        { 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02 }, // 4
+        { 0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E }, // 5
+        { 0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E }, // 6
+        { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 }, // 7
+        { 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E }, // 8
+        { 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C }, // 9
+        { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 }, // A
+        { 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E }, // D
+        { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F }, // E
+        { 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E }, // G
+        { 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 }, // H
+        { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F }, // L
+        { 0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11 }, // M
+        { 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11 }, // N
+        { 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E }, // O
+        { 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10 }, // P
+        { 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 }, // R
+        { 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E }, // S
+        { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E }, // U
+        { 0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04 }, // V
+        { 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 }, // Y
+    };
+    for (int i = 0; i < 7; i++) rows[i] = 0;
+    for (int g = 0; chars[g]; g++) {
+        if (chars[g] == ch) {
+            for (int i = 0; i < 7; i++) rows[i] = data[g][i];
+            return;
+        }
+    }
+}
+
+static int text7PixelWidth(const char *text, int scale) {
+    int chars = 0;
+    while (text[chars]) chars++;
+    return chars > 0 ? chars * 6 * scale - scale : 0;
+}
+
+static void drawChar7Detail(int x, int y, char ch, u16 color, int scale) {
+    if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+    u8 rows[7];
+    glyph7Rows(ch, rows);
+    for (int yy = 0; yy < 7; yy++) {
+        for (int xx = 0; xx < 5; xx++) {
+            if (rows[yy] & (1 << (4 - xx))) {
+                fillRectDetail(x + xx * scale, y + yy * scale, scale, scale, color);
+            }
+        }
+    }
+}
+
+static void drawText7Detail(int x, int y, const char *text, u16 color, int scale) {
+    int cursor = x;
+    while (*text) {
+        if (*text != ' ') drawChar7Detail(cursor, y, *text, color, scale);
+        cursor += 6 * scale;
+        text++;
+    }
+}
+
+// Banner/readout text with a dark drop shadow for depth.
+static void drawText7ShadowedDetail(int x, int y, const char *text, u16 color, u16 shadowColor, int scale) {
+    drawText7Detail(x + scale, y + scale, text, shadowColor, scale);
+    drawText7Detail(x, y, text, color, scale);
+}
+
+// Centered within a box, shrinking the scale until the text fits its width.
+static void drawText7CenteredBoxDetail(int left, int right, int y, const char *text, u16 color, u16 shadowColor, int maxScale) {
+    int boxW = right - left;
+    int scale = maxScale;
+    while (scale > 1 && text7PixelWidth(text, scale) > boxW) scale--;
+    int x = left + (boxW - text7PixelWidth(text, scale)) / 2;
+    drawText7ShadowedDetail(x, y, text, color, shadowColor, scale);
+}
+
+static const int SPIN_SIN[64] = {
+    0, 25, 50, 74, 98, 121, 142, 162, 181, 198, 213, 226, 237, 245, 251, 255,
+    256, 255, 251, 245, 237, 226, 213, 198, 181, 162, 142, 121, 98, 74, 50, 25,
+    0, -25, -50, -74, -98, -121, -142, -162, -181, -198, -213, -226, -237, -245, -251, -255,
+    -256, -255, -251, -245, -237, -226, -213, -198, -181, -162, -142, -121, -98, -74, -50, -25,
+};
+
+// Aircraft-style bomb. A 64-step sine table spins it smoothly while it falls.
+static void drawSpinnerDetail(const Object &o) {
+    int x = detailPixelFromFixedX(o.x);
+    int y = detailPixelFromFixedY(o.y);
+    int ext = detailScale(o.radius + 2);
+    int side = detailScale(o.radius / 2 + 1);
+    int phase = ((frameCounter * 2) / 5 + o.seed) & 63;
+    int sinF = SPIN_SIN[phase];
+    int cosF = SPIN_SIN[(phase + 16) & 63];
+    bool dim = (phase >> 2) & 1;
+    u16 body = dim ? C(16, 17, 18) : C(21, 21, 20);
+    u16 nose = dim ? C(25, 24, 21) : C(29, 27, 22);
+    int noseX = x + sinF * ext / 256;
+    int noseY = y - cosF * ext / 256;
+    int tailX = x - sinF * ext / 256;
+    int tailY = y + cosF * ext / 256;
+    int sideX = cosF * side / 256;
+    int sideY = sinF * side / 256;
+
+    fillTriangleDetail(noseX + 2, noseY + 2, tailX + sideX + 2, tailY + sideY + 2, tailX - sideX + 2, tailY - sideY + 2, C(3, 4, 5));
+    fillTriangleDetail(noseX, noseY, tailX + sideX, tailY + sideY, tailX - sideX, tailY - sideY, body);
+    fillTriangleDetail(noseX, noseY, x + sideX / 2, y + sideY / 2, x - sideX / 2, y - sideY / 2, nose);
+    fillTriangleDetail(tailX + sideX, tailY + sideY, tailX - sideX, tailY - sideY, tailX - sinF * 5 / 256, tailY + cosF * 5 / 256, C(9, 9, 9));
+    drawLineDetail(noseX, noseY, tailX + sideX, tailY + sideY, C(28, 28, 27));
+    drawSoftDotDetail(x, y, COL_YELLOW, C(18, 13, 5));
+}
+
+static void drawSalvoDetail(const Object &o) {
+    int x = detailPixelFromFixedX(o.x);
+    int y = detailPixelFromFixedY(o.y);
+    int pulse = ((frameCounter + o.seed) / 5) & 3;
+    int r = detailScale(3) + (pulse == 1 || pulse == 2 ? detailScale(1) : 0);
+    fillCircleDetail(x + 2, y + 2, r, C(5, 5, 6));
+    fillCircleDetail(x, y, r, C(17, 18, 19));
+    fillCircleDetail(x - 2, y - 2, r > detailScale(3) ? 5 : 2, C(25, 26, 27));
+    drawCircleOutlineDetail(x, y, r + 2, C(8, 9, 10));
+}
+
+static void drawUfoDetail(const Object &o) {
+    int x = detailPixelFromFixedX(o.x);
+    int y = detailPixelFromFixedY(o.y);
+    bool blink0 = ((frameCounter + o.seed) / 4) & 1;
+    bool blink1 = ((frameCounter + o.seed / 3) / 5) & 1;
+    bool blink2 = ((frameCounter + o.seed / 5) / 3) & 1;
+    bool blink3 = ((frameCounter + o.seed / 7) / 6) & 1;
+    u16 hot = blink0 ? C(31, 8, 3) : C(18, 3, 2);
+    u16 cold = blink1 ? C(8, 23, 20) : C(3, 9, 9);
+    fillTriangleDetail(x - 40, y + 2, x, y - 17, x + 40, y + 2, C(3, 5, 6));
+    fillTriangleDetail(x - 35, y + 7, x, y + 22, x + 35, y + 7, C(8, 9, 9));
+    fillRectDetail(x - 32, y - 2, 67, 12, C(15, 14, 12));
+    fillRectDetail(x - 20, y - 20, 42, 20, C(5, 11, 11));
+    fillRectDetail(x - 12, y - 25, 27, 7, C(10, 16, 15));
+    drawLineDetail(x - 32, y + 5, x + 32, y + 5, C(20, 18, 15));
+    drawLineDetail(x - 14, y + 15, x + 14, y + 15, C(24, 23, 20));
+    drawLineDetail(x - 17, y - 12, x + 12, y - 20, C(18, 19, 17));
+    drawLineDetail(x - 30, y + 2, x - 15, y + 10, C(5, 5, 5));
+    drawLineDetail(x + 10, y, x + 30, y + 7, C(4, 4, 4));
+    drawSoftDotDetail(x - 30, y + 7, hot, blink0 ? C(12, 2, 1) : C(6, 1, 1));
+    drawSoftDotDetail(x - 15, y + 12, cold, blink1 ? C(2, 10, 8) : C(1, 5, 4));
+    drawSoftDotDetail(x, y + 15, blink2 ? C(31, 25, 8) : C(10, 7, 2), blink2 ? C(12, 7, 2) : C(5, 3, 1));
+    drawSoftDotDetail(x + 15, y + 12, blink3 ? C(22, 8, 31) : C(7, 2, 9), blink3 ? C(8, 2, 12) : C(3, 1, 5));
+    drawSoftDotDetail(x + 30, y + 7, blink0 ? C(31, 12, 4) : C(13, 3, 1), blink0 ? C(12, 3, 1) : C(6, 1, 1));
+    putThickPixelDetail(x - 27, y + 7, hot);
+    putThickPixelDetail(x - 10, y + 12, cold);
+    putThickPixelDetail(x + 12, y + 12, hot);
+    putThickPixelDetail(x + 30, y + 7, C(22, 18, 8));
+}
+
+static void drawMeteorDetail(const Object &o) {
+    int x = detailPixelFromFixedX(o.x);
+    int y = detailPixelFromFixedY(o.y);
+    int r = detailScale(o.radius);
     int jag = o.type == OBJ_METEOR_BIG ? 4 : 3;
-    u16 shadow = o.type == OBJ_METEOR_BIG ? C(5, 5, 5) : C(7, 7, 7);
     u16 rockDark = o.type == OBJ_METEOR_BIG ? C(10, 8, 7) : C(12, 11, 9);
     u16 rockMid = o.type == OBJ_METEOR_BIG ? C(16, 14, 11) : C(19, 17, 13);
     u16 rockLight = o.type == OBJ_METEOR_BIG ? C(24, 22, 17) : C(27, 25, 18);
@@ -2167,122 +2314,42 @@ static void drawMeteor(const Object &o) {
     int vx[10];
     int vy[10];
     for (int i = 0; i < 10; i++) {
-        vx[i] = x + px[i] * r / 10 + pseudoJitter(o.seed, i, jag);
-        vy[i] = y + py[i] * r / 10 + pseudoJitter(o.seed, i + 17, jag);
-    }
-
-    for (int i = 0; i < 10; i++) {
-        int n = (i + 1) % 10;
-        fillTriangle(objectDrawTarget, x + 2, y + 2, vx[i] + 2, vy[i] + 2, vx[n] + 2, vy[n] + 2, shadow);
+        vx[i] = x + px[i] * r / 10 + detailScale(pseudoJitter(o.seed, i, jag));
+        vy[i] = y + py[i] * r / 10 + detailScale(pseudoJitter(o.seed, i + 17, jag));
     }
 
     for (int i = 0; i < 10; i++) {
         int n = (i + 1) % 10;
         u16 facet = (i < 3) ? rockLight : ((i < 7) ? rockMid : rockDark);
-        fillTriangle(objectDrawTarget, x, y, vx[i], vy[i], vx[n], vy[n], facet);
-        drawLine(objectDrawTarget, vx[i], vy[i], vx[n], vy[n], C(5, 5, 5));
+        fillTriangleDetail(x, y, vx[i], vy[i], vx[n], vy[n], facet);
+        drawLineDetailWidth(vx[i], vy[i], vx[n], vy[n], C(5, 5, 5), 2);
     }
 
-    drawLine(objectDrawTarget, x - r / 2, y - r / 3, x - r / 8, y - r / 2, C(30, 28, 20));
-    drawLine(objectDrawTarget, x - r / 2, y - r / 3, x - r / 3, y + r / 8, C(8, 8, 7));
-    fillCircle(objectDrawTarget, x - r / 3, y, r / 4, C(6, 6, 6));
-    drawCircleOutline(objectDrawTarget, x - r / 3, y, r / 4, C(14, 13, 11));
-    fillCircle(objectDrawTarget, x + r / 4, y + r / 4, r / 5, C(8, 8, 7));
-    putPixel(objectDrawTarget, x + r / 3, y - r / 4, rockLight);
-    putPixel(objectDrawTarget, x + r / 3 + 1, y - r / 4, rockLight);
+    drawLineDetail(x - r / 2, y - r / 3, x - r / 8, y - r / 2, C(30, 28, 20));
+    drawLineDetail(x - r / 2, y - r / 3, x - r / 3, y + r / 8, C(8, 8, 7));
+    fillCircleDetail(x - r / 3, y, r / 4, C(6, 6, 6));
+    drawCircleOutlineDetail(x - r / 3, y, r / 4, C(14, 13, 11));
+    fillCircleDetail(x + r / 4, y + r / 4, r / 5, C(8, 8, 7));
+    putThickPixelDetail(x + r / 3, y - r / 4, rockLight);
+    putThickPixelDetail(x + r / 3 + 2, y - r / 4, rockLight);
 }
 
-// Draw the aircraft-style bomb. The 16-step phase table gives a slow spin while
-// it falls.
-static void drawSpinner(const Object &o) {
-    int x = pixelFromFixed(o.x);
-    int y = pixelFromFixed(o.y);
-    int r = o.radius;
-    int phase = ((frameCounter / 10) + o.seed) & 15;
-    u16 body = phase & 1 ? C(16, 17, 18) : C(21, 21, 20);
-    u16 nose = phase & 1 ? C(25, 24, 21) : C(29, 27, 22);
-    u16 shadow = C(3, 4, 5);
-    u16 tail = C(9, 9, 9);
-    static const int dx[16] = { 0, 2, 3, 4, 4, 4, 3, 2, 0, -2, -3, -4, -4, -4, -3, -2 };
-    static const int dy[16] = { -4, -4, -3, -2, 0, 2, 3, 4, 4, 4, 3, 2, 0, -2, -3, -4 };
-    int noseX = x + dx[phase] * (r + 2) / 4;
-    int noseY = y + dy[phase] * (r + 2) / 4;
-    int tailX = x - dx[phase] * (r + 2) / 4;
-    int tailY = y - dy[phase] * (r + 2) / 4;
-    int sideX = -dy[phase] * (r / 2 + 1) / 4;
-    int sideY = dx[phase] * (r / 2 + 1) / 4;
-
-    fillTriangle(objectDrawTarget, noseX + 1, noseY + 1, tailX + sideX + 1, tailY + sideY + 1, tailX - sideX + 1, tailY - sideY + 1, shadow);
-    fillTriangle(objectDrawTarget, noseX, noseY, tailX + sideX, tailY + sideY, tailX - sideX, tailY - sideY, body);
-    fillTriangle(objectDrawTarget, noseX, noseY, x + sideX / 2, y + sideY / 2, x - sideX / 2, y - sideY / 2, nose);
-    fillTriangle(objectDrawTarget, tailX + sideX, tailY + sideY, tailX - sideX, tailY - sideY, tailX - dx[phase] * 2 / 4, tailY - dy[phase] * 2 / 4, tail);
-    drawLine(objectDrawTarget, noseX, noseY, tailX + sideX, tailY + sideY, C(28, 28, 27));
-    drawSoftDot(objectDrawTarget, x, y, COL_YELLOW, C(18, 13, 5));
-}
-
-// Guided missiles are blinking stars, matching the original-game behavior more
-// closely than a physical missile shape.
-static void drawMissile(const Object &o) {
-    int x = pixelFromFixed(o.x);
-    int y = pixelFromFixed(o.y);
+static void drawMissileDetail(const Object &o) {
+    int x = detailPixelFromFixedX(o.x);
+    int y = detailPixelFromFixedY(o.y);
     bool bright = ((frameCounter + o.seed) / 6) & 1;
     u16 glow = bright ? COL_WHITE : COL_CYAN;
     u16 core = bright ? COL_YELLOW : C(0, 12, 18);
-    drawLine(objectDrawTarget, x, y - 5, x, y + 5, C(0, 8, 12));
-    drawLine(objectDrawTarget, x - 5, y, x + 5, y, C(0, 8, 12));
-    drawLine(objectDrawTarget, x, y - 4, x, y + 4, glow);
-    drawLine(objectDrawTarget, x - 4, y, x + 4, y, glow);
-    drawLine(objectDrawTarget, x - 3, y - 3, x + 3, y + 3, glow);
-    drawLine(objectDrawTarget, x - 3, y + 3, x + 3, y - 3, glow);
-    fillCircle(objectDrawTarget, x, y, bright ? 2 : 1, core);
+    drawLineDetail(x, y - 12, x, y + 12, C(0, 8, 12));
+    drawLineDetail(x - 12, y, x + 12, y, C(0, 8, 12));
+    drawLineDetail(x, y - 10, x, y + 10, glow);
+    drawLineDetail(x - 10, y, x + 10, y, glow);
+    drawLineDetail(x - 7, y - 7, x + 7, y + 7, glow);
+    drawLineDetail(x - 7, y + 7, x + 7, y - 7, glow);
+    fillCircleDetail(x, y, bright ? 5 : 2, core);
 }
 
-// Detailed UFO with flickering lights. Its projectiles are spawned in
-// updateObjects() but rendered by drawSalvo().
-static void drawUfo(const Object &o) {
-    int x = pixelFromFixed(o.x);
-    int y = pixelFromFixed(o.y);
-    bool blink0 = ((frameCounter + o.seed) / 4) & 1;
-    bool blink1 = ((frameCounter + o.seed / 3) / 5) & 1;
-    bool blink2 = ((frameCounter + o.seed / 5) / 3) & 1;
-    bool blink3 = ((frameCounter + o.seed / 7) / 6) & 1;
-    u16 hot = blink0 ? C(31, 8, 3) : C(18, 3, 2);
-    u16 cold = blink1 ? C(8, 23, 20) : C(3, 9, 9);
-    fillTriangle(objectDrawTarget, x - 16, y + 1, x, y - 7, x + 16, y + 1, C(3, 5, 6));
-    fillTriangle(objectDrawTarget, x - 14, y + 3, x, y + 9, x + 14, y + 3, C(8, 9, 9));
-    fillRect(objectDrawTarget, x - 13, y - 1, 27, 5, C(15, 14, 12));
-    fillRect(objectDrawTarget, x - 8, y - 8, 17, 8, C(5, 11, 11));
-    fillRect(objectDrawTarget, x - 5, y - 10, 11, 3, C(10, 16, 15));
-    drawLine(objectDrawTarget, x - 16, y + 2, x + 16, y + 2, C(20, 18, 15));
-    drawLine(objectDrawTarget, x - 10, y + 6, x + 10, y + 6, C(24, 23, 20));
-    drawLine(objectDrawTarget, x - 7, y - 5, x + 5, y - 8, C(18, 19, 17));
-    drawLine(objectDrawTarget, x - 12, y + 1, x - 6, y + 4, C(5, 5, 5));
-    drawLine(objectDrawTarget, x + 4, y, x + 12, y + 3, C(4, 4, 4));
-    drawSoftDot(objectDrawTarget, x - 12, y + 3, hot, blink0 ? C(12, 2, 1) : C(6, 1, 1));
-    drawSoftDot(objectDrawTarget, x - 6, y + 5, cold, blink1 ? C(2, 10, 8) : C(1, 5, 4));
-    drawSoftDot(objectDrawTarget, x, y + 6, blink2 ? C(31, 25, 8) : C(10, 7, 2), blink2 ? C(12, 7, 2) : C(5, 3, 1));
-    drawSoftDot(objectDrawTarget, x + 6, y + 5, blink3 ? C(22, 8, 31) : C(7, 2, 9), blink3 ? C(8, 2, 12) : C(3, 1, 5));
-    drawSoftDot(objectDrawTarget, x + 12, y + 3, blink0 ? C(31, 12, 4) : C(13, 3, 1), blink0 ? C(12, 3, 1) : C(6, 1, 1));
-    putPixel(objectDrawTarget, x - 11, y + 3, hot);
-    putPixel(objectDrawTarget, x - 4, y + 5, cold);
-    putPixel(objectDrawTarget, x + 5, y + 5, hot);
-    putPixel(objectDrawTarget, x + 12, y + 3, C(22, 18, 8));
-}
-
-// UFO projectile: a small grey pulsing orb.
-static void drawSalvo(const Object &o) {
-    int x = pixelFromFixed(o.x);
-    int y = pixelFromFixed(o.y);
-    int pulse = ((frameCounter + o.seed) / 5) & 3;
-    int r = 3 + (pulse == 1 || pulse == 2 ? 1 : 0);
-    fillCircle(objectDrawTarget, x + 1, y + 1, r, C(5, 5, 6));
-    fillCircle(objectDrawTarget, x, y, r, C(17, 18, 19));
-    fillCircle(objectDrawTarget, x - 1, y - 1, r > 3 ? 2 : 1, C(25, 26, 27));
-    drawCircleOutline(objectDrawTarget, x, y, r + 1, C(8, 9, 10));
-}
-
-// Skip drawing objects that are fully offscreen. This reduces overdraw in
-// DraStic without changing gameplay.
+// Skip drawing objects that are fully offscreen.
 static bool objectVisibleForDraw(const Object &o) {
     int x = o.x >> FP;
     int y = o.y >> FP;
@@ -2290,106 +2357,34 @@ static bool objectVisibleForDraw(const Object &o) {
     return x + pad >= 0 && x - pad < SCREEN_W && y + pad >= 0 && y - pad < SCREEN_H;
 }
 
-static bool objectHasSmoothDraw(const Object &o) {
-    return o.type == OBJ_METEOR_BIG || o.type == OBJ_METEOR_SMALL ||
-           o.type == OBJ_SPINNER_BIG || o.type == OBJ_SPINNER_SMALL ||
-           o.type == OBJ_MISSILE || o.type == OBJ_SALVO;
-}
-
-static void drawObjectBody(const Object &o) {
-    switch (o.type) {
-        case OBJ_METEOR_BIG:
-        case OBJ_METEOR_SMALL: drawMeteor(o); break;
-        case OBJ_SPINNER_BIG:
-        case OBJ_SPINNER_SMALL: drawSpinner(o); break;
-        case OBJ_MISSILE: drawMissile(o); break;
-        case OBJ_UFO: drawUfo(o); break;
-        case OBJ_SALVO: drawSalvo(o); break;
-        default: break;
-    }
-}
-
 static void clearDetailOverlay() {
     if (nativeTop.detailPixels) {
         memset(nativeTop.detailPixels, 0, RGDS_SCREEN_W * RGDS_SCREEN_H * sizeof(u32));
     }
-}
-
-static void stampLowPixelToDetail(int sx, int sy, int centerX, int centerY, int centerX2, int centerY2, u16 color) {
-    if (!nativeTop.detailPixels || color == 0) return;
-    int shiftX2 = centerX2 - centerX * 5;
-    int shiftY2 = centerY2 - centerY * 5;
-    int left2 = sx * 5 + shiftX2;
-    int top2 = sy * 5 + shiftY2;
-    int x0 = floorDivInt(left2, 2);
-    int y0 = floorDivInt(top2, 2);
-    int x1 = floorDivInt(left2 + 4, 2);
-    int y1 = floorDivInt(top2 + 4, 2);
-    if (x1 < 0 || y1 < 0 || x0 >= RGDS_SCREEN_W || y0 >= RGDS_SCREEN_H) return;
-    if (x0 < 0) x0 = 0;
-    if (y0 < 0) y0 = 0;
-    if (x1 >= RGDS_SCREEN_W) x1 = RGDS_SCREEN_W - 1;
-    if (y1 >= RGDS_SCREEN_H) y1 = RGDS_SCREEN_H - 1;
-
-    u32 argb = rgb15ToArgb(color);
-    for (int y = y0; y <= y1; y++) {
-        u32 *row = nativeTop.detailPixels + y * RGDS_SCREEN_W;
-        for (int x = x0; x <= x1; x++) row[x] = argb;
+    if (nativeBottom.detailPixels) {
+        memset(nativeBottom.detailPixels, 0, RGDS_SCREEN_W * RGDS_SCREEN_H * sizeof(u32));
     }
 }
 
-static void stampSmoothObjectToDetail(const Object &o) {
-    int centerX = pixelFromFixed(o.x);
-    int centerY = pixelFromFixed(o.y);
-    int pad = o.radius + 26;
-    int minX = centerX - pad;
-    int maxX = centerX + pad;
-    int minY = centerY - pad;
-    int maxY = centerY + pad;
-    if (minX < 0) minX = 0;
-    if (minY < 0) minY = 0;
-    if (maxX >= SCREEN_W) maxX = SCREEN_W - 1;
-    if (maxY >= SCREEN_H) maxY = SCREEN_H - 1;
-
-    memset(objectSpriteScratch, 0, sizeof(objectSpriteScratch));
-    Object snapped = o;
-    snapped.x = centerX << FP;
-    snapped.y = centerY << FP;
-    u16 *oldTarget = objectDrawTarget;
-    int oldAlpha = drawAlpha;
-    objectDrawTarget = objectSpriteScratch;
-    drawAlpha = 255;
-    drawObjectBody(snapped);
-    drawAlpha = oldAlpha;
-    objectDrawTarget = oldTarget;
-
-    int centerX2 = (o.x * 5 + ONE / 2) / ONE;
-    int centerY2 = (o.y * 5 + ONE / 2) / ONE;
-    for (int sy = minY; sy <= maxY; sy++) {
-        const u16 *row = objectSpriteScratch + sy * SCREEN_W;
-        for (int sx = minX; sx <= maxX; sx++) {
-            stampLowPixelToDetail(sx, sy, centerX, centerY, centerX2, centerY2, row[sx]);
-        }
-    }
-}
-
-static void drawSmoothObjectsToDetail() {
+// Dispatch each active object to its native-resolution drawing routine, drawn
+// into the gameplay (top) detail layer.
+static void drawObjectsToDetail() {
     clearDetailOverlay();
-    if (!nativeTop.detailPixels) return;
-    for (int i = 0; i < MAX_OBJECTS; i++) {
-        if (!objects[i].active) continue;
-        if (!objectHasSmoothDraw(objects[i])) continue;
-        if (!objectVisibleForDraw(objects[i])) continue;
-        stampSmoothObjectToDetail(objects[i]);
-    }
-}
-
-// Dispatch each active object to its type-specific drawing routine.
-static void drawObjects() {
+    detailTarget = nativeTop.detailPixels;
+    if (!detailTarget) return;
     for (int i = 0; i < MAX_OBJECTS; i++) {
         if (!objects[i].active) continue;
         if (!objectVisibleForDraw(objects[i])) continue;
-        if (!objectHasSmoothDraw(objects[i])) drawObjectBody(objects[i]);
+        switch (objects[i].type) {
+            case OBJ_METEOR_BIG:
+            case OBJ_METEOR_SMALL: drawMeteorDetail(objects[i]); break;
+            case OBJ_SPINNER_BIG:
+            case OBJ_SPINNER_SMALL: drawSpinnerDetail(objects[i]); break;
+            case OBJ_MISSILE: drawMissileDetail(objects[i]); break;
+            case OBJ_SALVO: drawSalvoDetail(objects[i]); break;
+            case OBJ_UFO: drawUfoDetail(objects[i]); break;
+            default: break;
+        }
     }
 }
 
@@ -2422,48 +2417,60 @@ static void drawParticles() {
 static void drawPlayer() {
     if (deathTimer > 0) return;
     if (invulnTimer > 0 && ((frameCounter / 5) & 1)) return;
-    int x = playerX;
-    int y = PLAYER_Y;
+    detailTarget = nativeTop.detailPixels;
+    int x = playerX * RGDS_SCREEN_W / SCREEN_W;
+    int y = detailScale(PLAYER_Y);
     u16 dark = C(6, 5, 4);
     u16 bronze = C(15, 10, 6);
     u16 silver = C(22, 21, 18);
     u16 highlight = C(29, 28, 24);
     int wheelPhase = (playerX / 3) & 3;
 
-    fillRect(backMain, x - 5, y, 11, 2, dark);
-    fillCircle(backMain, x - 3, y - 1, 2, C(8, 7, 6));
-    fillCircle(backMain, x + 3, y - 1, 2, C(8, 7, 6));
-    putPixel(backMain, x - 3, y - 1, silver);
-    putPixel(backMain, x + 3, y - 1, silver);
+    fillRectDetail(x - 12, y, 27, 5, dark);
+    fillCircleDetail(x - 7, y - 2, 5, C(8, 7, 6));
+    fillCircleDetail(x + 7, y - 2, 5, C(8, 7, 6));
+    putThickPixelDetail(x - 7, y - 2, silver);
+    putThickPixelDetail(x + 7, y - 2, silver);
     if (wheelPhase & 1) {
-        putPixel(backMain, x - 3, y - 3, highlight);
-        putPixel(backMain, x + 3, y - 3, highlight);
+        putThickPixelDetail(x - 7, y - 7, highlight);
+        putThickPixelDetail(x + 7, y - 7, highlight);
     } else {
-        putPixel(backMain, x - 5, y - 1, highlight);
-        putPixel(backMain, x + 1, y - 1, highlight);
+        putThickPixelDetail(x - 12, y - 2, highlight);
+        putThickPixelDetail(x + 2, y - 2, highlight);
     }
 
-    fillTriangle(backMain, x, y - 12, x - 5, y - 3, x + 5, y - 3, bronze);
-    fillTriangle(backMain, x, y - 12, x - 2, y - 4, x + 2, y - 4, silver);
-    fillRect(backMain, x - 2, y - 16, 5, 9, dark);
-    fillRect(backMain, x - 1, y - 16, 3, 8, silver);
-    fillRect(backMain, x, y - 17, 1, 10, highlight);
-    fillRect(backMain, x - 4, y - 5, 9, 4, C(12, 8, 5));
-    drawLine(backMain, x - 4, y - 4, x + 4, y - 4, highlight);
-    putPixel(backMain, x - 2, y - 7, C(24, 19, 12));
-    putPixel(backMain, x + 2, y - 7, C(24, 19, 12));
+    fillTriangleDetail(x, y - 30, x - 12, y - 7, x + 12, y - 7, bronze);
+    fillTriangleDetail(x, y - 30, x - 5, y - 10, x + 5, y - 10, silver);
+    fillRectDetail(x - 5, y - 40, 12, 22, dark);
+    fillRectDetail(x - 2, y - 40, 7, 20, silver);
+    fillRectDetail(x, y - 42, 2, 25, highlight);
+    fillRectDetail(x - 10, y - 12, 22, 10, C(12, 8, 5));
+    drawLineDetail(x - 10, y - 10, x + 10, y - 10, highlight);
+    putThickPixelDetail(x - 5, y - 17, C(24, 19, 12));
+    putThickPixelDetail(x + 5, y - 17, C(24, 19, 12));
 }
 
-// Lower-screen HUD: uses a generated bitmap template for the neon panels, then
-// draws only live values and the hyper fill over it.
+// Lower-screen HUD: a generated bitmap template provides the neon panels and
+// labels; the live SCORE/LEVEL/LIVES numbers are drawn at native resolution in
+// the bottom detail layer with the larger 5x7 font, and the hyper fill is drawn
+// over the template.
 static void drawSubScreen() {
     memcpy(backSub, hudTemplates[gameSpeedStep], SCREEN_W * SCREEN_H * sizeof(u16));
     nativeBottom.backdrop = (NativeBackdrop)(NATIVE_BG_HUD_EASY + gameSpeedStep);
     nativeBottomTransparentBase = hudTemplates[gameSpeedStep];
 
-    drawIntCenteredInBox(backSub, 8, 88, 29, score, COL_HUD_RUST, 3);
-    drawIntCentered(backSub, 132, 29, levelForScore(score), COL_HUD_RUST, 3);
-    drawIntCentered(backSub, 215, 29, lives, COL_HUD_RUST, 3);
+    detailTarget = nativeBottom.detailPixels;
+    const u16 valueColor = C(31, 24, 13);
+    const u16 valueShadow = C(6, 2, 1);
+    const int valueY = 66;
+
+    char buf[16];
+    intToText(score, buf, sizeof(buf));
+    drawText7CenteredBoxDetail(20, 220, valueY, buf, valueColor, valueShadow, 6);
+    intToText(levelForScore(score), buf, sizeof(buf));
+    drawText7CenteredBoxDetail(240, 420, valueY, buf, valueColor, valueShadow, 6);
+    intToText(lives, buf, sizeof(buf));
+    drawText7CenteredBoxDetail(448, 628, valueY, buf, valueColor, valueShadow, 6);
 
     int hyperFull = timerByGameSpeed(90);
     int charge = hyperTimer > 0 ? (hyperFull - hyperTimer) : hyperFull;
@@ -2491,13 +2498,17 @@ static void drawGame() {
         return;
     }
     drawBackground();
-    drawObjects();
-    drawSmoothObjectsToDetail();
+    drawObjectsToDetail();
     drawBullets();
     drawParticles();
     drawPlayer();
-    if (paused && !gameOver) drawTextCentered(backMain, SCREEN_W / 2, 82, "PAUSED", COL_WHITE, 3);
-    if (gameOver) drawTextCentered(backMain, SCREEN_W / 2, 82, "GAME OVER", COL_WHITE, 3);
+    detailTarget = nativeTop.detailPixels;
+    if (paused && !gameOver) {
+        drawText7CenteredBoxDetail(0, RGDS_SCREEN_W, 205, "PAUSED", C(30, 24, 12), C(7, 3, 1), 7);
+    }
+    if (gameOver) {
+        drawText7CenteredBoxDetail(0, RGDS_SCREEN_W, 205, "GAME OVER", C(30, 24, 12), C(7, 3, 1), 7);
+    }
     drawSubScreen();
 }
 
@@ -2614,7 +2625,7 @@ int main(int argc, char **argv) {
     }
     nativeDualDisplay = displays >= 2;
     if (!nativeCreatePanel(nativeTop, "AirdomeRGDS Top", 0, nativeDualDisplay, true)) return 1;
-    if (!nativeCreatePanel(nativeBottom, "AirdomeRGDS Bottom", nativeDualDisplay ? 1 : 0, nativeDualDisplay, false)) return 1;
+    if (!nativeCreatePanel(nativeBottom, "AirdomeRGDS Bottom", nativeDualDisplay ? 1 : 0, nativeDualDisplay, true)) return 1;
 
     for (int i = 0; i < SDL_NumJoysticks(); ++i) {
         if (SDL_IsGameController(i)) {
