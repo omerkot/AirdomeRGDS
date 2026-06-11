@@ -1375,6 +1375,100 @@ static void intToText(int value, char *buf, int bufSize) {
     buf[idx] = 0;
 }
 
+// Low-resolution bitmap font used by the lower-screen HUD values.
+static void glyphRows(char ch, u8 rows[5]) {
+    for (int i = 0; i < 5; i++) rows[i] = 0;
+    switch (ch) {
+        case '0': rows[0]=7; rows[1]=5; rows[2]=5; rows[3]=5; rows[4]=7; break;
+        case '1': rows[0]=2; rows[1]=6; rows[2]=2; rows[3]=2; rows[4]=7; break;
+        case '2': rows[0]=7; rows[1]=1; rows[2]=7; rows[3]=4; rows[4]=7; break;
+        case '3': rows[0]=7; rows[1]=1; rows[2]=3; rows[3]=1; rows[4]=7; break;
+        case '4': rows[0]=5; rows[1]=5; rows[2]=7; rows[3]=1; rows[4]=1; break;
+        case '5': rows[0]=7; rows[1]=4; rows[2]=7; rows[3]=1; rows[4]=7; break;
+        case '6': rows[0]=7; rows[1]=4; rows[2]=7; rows[3]=5; rows[4]=7; break;
+        case '7': rows[0]=7; rows[1]=1; rows[2]=2; rows[3]=2; rows[4]=2; break;
+        case '8': rows[0]=7; rows[1]=5; rows[2]=7; rows[3]=5; rows[4]=7; break;
+        case '9': rows[0]=7; rows[1]=5; rows[2]=7; rows[3]=1; rows[4]=7; break;
+        case 'A': rows[0]=7; rows[1]=5; rows[2]=7; rows[3]=5; rows[4]=5; break;
+        case 'B': rows[0]=6; rows[1]=5; rows[2]=6; rows[3]=5; rows[4]=6; break;
+        case 'C': rows[0]=7; rows[1]=4; rows[2]=4; rows[3]=4; rows[4]=7; break;
+        case 'D': rows[0]=6; rows[1]=5; rows[2]=5; rows[3]=5; rows[4]=6; break;
+        case 'E': rows[0]=7; rows[1]=4; rows[2]=6; rows[3]=4; rows[4]=7; break;
+        case 'F': rows[0]=7; rows[1]=4; rows[2]=6; rows[3]=4; rows[4]=4; break;
+        case 'G': rows[0]=7; rows[1]=4; rows[2]=5; rows[3]=5; rows[4]=7; break;
+        case 'H': rows[0]=5; rows[1]=5; rows[2]=7; rows[3]=5; rows[4]=5; break;
+        case 'I': rows[0]=7; rows[1]=2; rows[2]=2; rows[3]=2; rows[4]=7; break;
+        case 'K': rows[0]=5; rows[1]=5; rows[2]=6; rows[3]=5; rows[4]=5; break;
+        case 'L': rows[0]=4; rows[1]=4; rows[2]=4; rows[3]=4; rows[4]=7; break;
+        case 'M': rows[0]=5; rows[1]=7; rows[2]=7; rows[3]=5; rows[4]=5; break;
+        case 'N': rows[0]=5; rows[1]=7; rows[2]=7; rows[3]=7; rows[4]=5; break;
+        case 'O': rows[0]=7; rows[1]=5; rows[2]=5; rows[3]=5; rows[4]=7; break;
+        case 'P': rows[0]=7; rows[1]=5; rows[2]=7; rows[3]=4; rows[4]=4; break;
+        case 'R': rows[0]=7; rows[1]=5; rows[2]=6; rows[3]=5; rows[4]=5; break;
+        case 'S': rows[0]=7; rows[1]=4; rows[2]=7; rows[3]=1; rows[4]=7; break;
+        case 'T': rows[0]=7; rows[1]=2; rows[2]=2; rows[3]=2; rows[4]=2; break;
+        case 'U': rows[0]=5; rows[1]=5; rows[2]=5; rows[3]=5; rows[4]=7; break;
+        case 'V': rows[0]=5; rows[1]=5; rows[2]=5; rows[3]=5; rows[4]=2; break;
+        case 'W': rows[0]=5; rows[1]=5; rows[2]=7; rows[3]=7; rows[4]=5; break;
+        case 'X': rows[0]=5; rows[1]=5; rows[2]=2; rows[3]=5; rows[4]=5; break;
+        case 'Y': rows[0]=5; rows[1]=5; rows[2]=2; rows[3]=2; rows[4]=2; break;
+        case '-': rows[2]=7; break;
+        case ':': rows[1]=2; rows[3]=2; break;
+        case '/': rows[0]=1; rows[1]=1; rows[2]=2; rows[3]=4; rows[4]=4; break;
+        default: break;
+    }
+}
+
+static void drawChar(u16 *fb, int x, int y, char ch, u16 color, int scale) {
+    if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+    u8 rows[5];
+    glyphRows(ch, rows);
+    for (int yy = 0; yy < 5; yy++) {
+        for (int xx = 0; xx < 3; xx++) {
+            if (rows[yy] & (1 << (2 - xx))) {
+                fillRect(fb, x + xx * scale, y + yy * scale, scale, scale, color);
+            }
+        }
+    }
+}
+static int textPixelWidth(const char *text, int scale) {
+    int chars = 0;
+    while (text[chars]) chars++;
+    return chars > 0 ? chars * 4 * scale - scale : 0;
+}
+
+static void drawText(u16 *fb, int x, int y, const char *text, u16 color, int scale) {
+    int cursor = x;
+    while (*text) {
+        if (*text != ' ') drawChar(fb, cursor, y, *text, color, scale);
+        cursor += 4 * scale;
+        text++;
+    }
+}
+
+static void drawTextCentered(u16 *fb, int cx, int y, const char *text, u16 color, int scale) {
+    drawText(fb, cx - textPixelWidth(text, scale) / 2, y, text, color, scale);
+}
+static void drawTextCenteredInBox(u16 *fb, int left, int right, int y, const char *text, u16 color, int maxScale) {
+    int maxWidth = right - left + 1;
+    int x = left + (maxWidth - textPixelWidth(text, maxScale)) / 2;
+    drawText(fb, x, y, text, color, maxScale);
+}
+
+static void drawIntCentered(u16 *fb, int cx, int y, int value, u16 color, int scale) {
+    char buf[16];
+    intToText(value, buf, sizeof(buf));
+    drawTextCentered(fb, cx, y, buf, color, scale);
+}
+
+// Center an integer inside a fixed panel box. Used for score so 2-digit and
+// 6-digit values share the same visual center.
+static void drawIntCenteredInBox(u16 *fb, int left, int right, int y, int value, u16 color, int maxScale) {
+    char buf[16];
+    intToText(value, buf, sizeof(buf));
+    drawTextCenteredInBox(fb, left, right, y, buf, color, maxScale);
+}
+
 // Add a single particle to the fixed pool. If the pool is full, the effect is
 // simply dropped; gameplay must never block on visual effects.
 static void addParticle(int x, int y, int vx, int vy, int life, u16 color) {
@@ -2450,27 +2544,16 @@ static void drawPlayer() {
     putThickPixelDetail(x + 5, y - 17, C(24, 19, 12));
 }
 
-// Lower-screen HUD: a generated bitmap template provides the neon panels and
-// labels; the live SCORE/LEVEL/LIVES numbers are drawn at native resolution in
-// the bottom detail layer with the larger 5x7 font, and the hyper fill is drawn
-// over the template.
+// Lower-screen HUD: uses a generated bitmap template for the neon panels, then
+// draws only live values and the hyper fill over it.
 static void drawSubScreen() {
     memcpy(backSub, hudTemplates[gameSpeedStep], SCREEN_W * SCREEN_H * sizeof(u16));
     nativeBottom.backdrop = (NativeBackdrop)(NATIVE_BG_HUD_EASY + gameSpeedStep);
     nativeBottomTransparentBase = hudTemplates[gameSpeedStep];
 
-    detailTarget = nativeBottom.detailPixels;
-    const u16 valueColor = C(31, 24, 13);
-    const u16 valueShadow = C(6, 2, 1);
-    const int valueY = 66;
-
-    char buf[16];
-    intToText(score, buf, sizeof(buf));
-    drawText7CenteredBoxDetail(20, 220, valueY, buf, valueColor, valueShadow, 6);
-    intToText(levelForScore(score), buf, sizeof(buf));
-    drawText7CenteredBoxDetail(240, 420, valueY, buf, valueColor, valueShadow, 6);
-    intToText(lives, buf, sizeof(buf));
-    drawText7CenteredBoxDetail(448, 628, valueY, buf, valueColor, valueShadow, 6);
+    drawIntCenteredInBox(backSub, 8, 88, 29, score, COL_HUD_RUST, 3);
+    drawIntCentered(backSub, 132, 29, levelForScore(score), COL_HUD_RUST, 3);
+    drawIntCentered(backSub, 215, 29, lives, COL_HUD_RUST, 3);
 
     int hyperFull = timerByGameSpeed(90);
     int charge = hyperTimer > 0 ? (hyperFull - hyperTimer) : hyperFull;
@@ -2625,7 +2708,7 @@ int main(int argc, char **argv) {
     }
     nativeDualDisplay = displays >= 2;
     if (!nativeCreatePanel(nativeTop, "AirdomeRGDS Top", 0, nativeDualDisplay, true)) return 1;
-    if (!nativeCreatePanel(nativeBottom, "AirdomeRGDS Bottom", nativeDualDisplay ? 1 : 0, nativeDualDisplay, true)) return 1;
+    if (!nativeCreatePanel(nativeBottom, "AirdomeRGDS Bottom", nativeDualDisplay ? 1 : 0, nativeDualDisplay, false)) return 1;
 
     for (int i = 0; i < SDL_NumJoysticks(); ++i) {
         if (SDL_IsGameController(i)) {

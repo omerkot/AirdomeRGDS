@@ -2,12 +2,13 @@
 
 AirdomeRGDS is a native Linux fixed shooter for the Anbernic RG DS running the official Linux firmware. It is inspired by classic falling-object arcade defense games.
 
-The game runs directly through SDL2 on the RG DS Linux environment, opens both physical displays, and renders the playfield and lower HUD as native 640x480 panels.
+The game runs directly through SDL2 on the RG DS Linux environment, opens both physical displays, uses RG DS-ready 640x480 backdrops, and draws top-screen gameplay sprites through a native-resolution detail layer.
 
 ## Status
 
 - Target device: Anbernic RG DS official Linux firmware.
 - Display: two SDL/Wayland displays at 640x480 each.
+- Graphics: 640x480 title, level, and HUD backdrops with native-resolution top-screen object rendering.
 - Controls: RG DS buttons, d-pad, left stick, and lower touchscreen.
 - Audio: SDL audio with generated/embedded PCM samples, scaled to the stock RG DS loader volume.
 - Packaging: Port-style folder under `/mnt/mmc/Ports`.

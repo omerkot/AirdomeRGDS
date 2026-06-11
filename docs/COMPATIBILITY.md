@@ -26,6 +26,8 @@ the launcher sets:
 SDL2_SWAP_LCD=1
 ```
 
+Level, title, and HUD backdrops are prepared as 640x480 RG DS assets. Top-screen gameplay objects and the cannon are drawn into a native-resolution detail layer so falling objects and shots avoid chunky low-resolution upscaling. The lower screen uses generated HUD backdrops with compact live readouts drawn over the HUD overlay.
+
 ## Touch Handling
 
 Only the lower touchscreen is known to report touch events on tested firmware. Upper-screen touch has not been observed through SDL.

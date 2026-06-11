@@ -16,6 +16,8 @@ The `.argb` files are raw little-endian 32-bit ARGB buffers at 640x480. They are
 
 `assets/rgds/title.png` is a 640x960 title source image retained as editable project material.
 
+Gameplay sprites such as the cannon, UFO, falling asteroids, bombs, missiles, salvos, and flickering effects are drawn procedurally by the native renderer rather than stored as copied third-party art assets.
+
 ## Generated Headers
 
 The following generated headers are also checked in as build inputs:
